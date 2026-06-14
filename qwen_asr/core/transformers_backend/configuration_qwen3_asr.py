@@ -97,7 +97,7 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         n_window=100,
         output_dim=3584,
         n_window_infer=400,
-        conv_chunksize=500,
+        conv_chunksize=64,
         downsample_hidden_size=480,
         **kwargs,
     ):

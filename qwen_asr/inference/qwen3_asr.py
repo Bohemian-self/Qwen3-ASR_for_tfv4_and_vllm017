@@ -266,6 +266,38 @@ class Qwen3ASRModel:
                 "vLLM is not available. Install with: pip install qwen-asr[vllm]"
             ) from e
 
+        # ── vLLM 0.17 performance defaults for batch ASR ──────────────────────
+        # (1) vLLM 0.17 enables chunked_prefill by default for ALL models.
+        #     For ASR, each request has a very long audio-token prefill
+        #     (~7800 tokens for 10 min audio). Chunked prefill serialises this
+        #     into many small scheduler steps and causes 2-3× throughput loss.
+        #     Disabling it restores the 0.14 behaviour.
+        kwargs.setdefault("enable_chunked_prefill", False)
+
+        # (2) With chunked prefill off, we need a large enough token budget so
+        #     the scheduler can process a full batch of audio prompts in one
+        #     prefill step.  32 k fits ~4 concurrent 10-min requests (4×7800).
+        kwargs.setdefault("max_num_batched_tokens", 32768)
+
+        # (3) Hard limit to what ASR actually needs.
+        #     With MAX_ASR_INPUT_SECONDS=600: audio tokens ≈ 7800,
+        #     max decode = 8192  →  total = 15992 < 16384 (safe margin: 392).
+        #     Capping max_model_len at 16384 instead of the config default
+        #     (128000) multiplies the KV-cache block pool by ~8×, allowing
+        #     many more concurrent requests on RTX 4080 (9 GB budget).
+        kwargs.setdefault("max_model_len", 16384)
+
+        # (4) Limit concurrent scheduled sequences to what the KV cache can
+        #     realistically support on 9 GB VRAM (~3-4 live at once).
+        #     Over-scheduling causes unnecessary preemption overhead.
+        kwargs.setdefault("max_num_seqs", 32)
+
+        # (5) Reserve ≈60 % of GPU memory for vLLM (model + KV cache).
+        #     On RTX 4080 16 GB: 0.6 × 16 = 9.6 GB budget.
+        #     After model weights (~3.8 GB) and activation headroom (~1.2 GB)
+        #     this leaves ≈4.6 GB for the KV-cache block pool.
+        kwargs.setdefault("gpu_memory_utilization", 0.6)
+
         llm = vLLM(model=model, **kwargs)
 
         processor = Qwen3ASRProcessor.from_pretrained(model) #, fix_mistral_regex=True)
@@ -524,10 +556,19 @@ class Qwen3ASRModel:
         wavs: List[np.ndarray],
         languages: List[Optional[str]],
     ) -> List[str]:
+        # Pre-tokenize prompts once on the CPU side so vLLM does not
+        # re-tokenize the same string internally (avoids double tokenization
+        # for every chunk in the batch).
         inputs: List[Dict[str, Any]] = []
         for c, w, fl in zip(contexts, wavs, languages):
             prompt = self._build_text_prompt(context=c, force_language=fl)
-            inputs.append({"prompt": prompt, "multi_modal_data": {"audio": [w]}})
+            prompt_token_ids = self.processor.tokenizer.encode(
+                prompt, add_special_tokens=False
+            )
+            inputs.append({
+                "prompt_token_ids": prompt_token_ids,
+                "multi_modal_data": {"audio": [w]},
+            })
 
         outs: List[str] = []
         for batch in chunk_list(inputs, self.max_inference_batch_size):

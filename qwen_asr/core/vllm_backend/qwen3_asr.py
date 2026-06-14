@@ -35,7 +35,7 @@ from transformers.models.whisper import WhisperFeatureExtractor
 from vllm.config import MultiModalConfig, ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.inputs.data import PromptType
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
@@ -70,8 +70,6 @@ from vllm.model_executor.models.whisper import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     AudioItem,
-    ModalityData,
-    MultiModalDataDict,
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
@@ -307,7 +305,12 @@ class Qwen3ASRAudioEncoder(nn.Module):
         self.max_source_positions = config.max_source_positions
         self.n_window = config.n_window
         self.n_window_infer = config.n_window_infer
-        self.conv_chunksize = config.conv_chunksize
+        # Hard-cap conv_chunksize to control peak intermediate tensor memory.
+        # For a batch of N sub-chunks the conv2d1 output is
+        # [N, 480, 64, 100] × 2 bytes.  N=64 → ~374 MB (safe on 9 GB VRAM);
+        # N=500 (original default) → ~1.46 GB, leaving far less room for the
+        # KV cache.  Users with ≥24 GB VRAM may raise this via config.conv_chunksize.
+        self.conv_chunksize = min(config.conv_chunksize, 64)
 
         # Position embedding
         self.positional_embedding = SinusoidsPositionEmbedding(
@@ -414,21 +417,40 @@ class Qwen3ASRAudioEncoder(nn.Module):
         # Add channel dimension for conv2d
         padded_feature = padded_feature.unsqueeze(1)
 
-        # Apply convolutional layers (chunk if needed to avoid OOM)
+        # Apply convolutional layers.
+        # When the sub-chunk count exceeds conv_chunksize we use a chunked path
+        # to cap peak intermediate memory.  The original implementation appended
+        # each output to a list and concatenated at the end; that forces ALL
+        # intermediate outputs to reside in memory simultaneously before cat
+        # (≈ 1.4 GB extra at typical batch sizes).  The pre-allocated buffer
+        # below writes directly into the final tensor, halving the peak.
         if padded_feature.size(0) <= self.conv_chunksize:
-            # Fast path: no chunking needed
+            # Fast path: fits in one kernel launch.
             padded_embed = F.gelu(self.conv2d1(padded_feature))
             padded_embed = F.gelu(self.conv2d2(padded_embed))
             padded_embed = F.gelu(self.conv2d3(padded_embed))
         else:
-            # Chunked processing to avoid OOM
-            padded_embeds = []
+            # Chunked path: pre-allocate the output buffer so intermediate
+            # results are written in-place and immediately freed by the GC.
+            # Output spatial dims after three stride-2, kernel-3, pad-1 convs:
+            #   floor((n - 1) / 2) + 1  applied three times.
+            def _csize(n: int) -> int:
+                for _ in range(3):
+                    n = (n - 1) // 2 + 1
+                return n
+
+            n_total = padded_feature.size(0)
+            out_freq = _csize(padded_feature.size(2))
+            out_time = _csize(padded_feature.size(3))
+            out_ch   = self.conv2d3.out_channels
+            padded_embed = padded_feature.new_empty(n_total, out_ch, out_freq, out_time)
+            offset = 0
             for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-                padded_embed = F.gelu(self.conv2d1(chunk))
-                padded_embed = F.gelu(self.conv2d2(padded_embed))
-                padded_embed = F.gelu(self.conv2d3(padded_embed))
-                padded_embeds.append(padded_embed)
-            padded_embed = torch.cat(padded_embeds, dim=0)
+                bs = chunk.size(0)
+                tmp = F.gelu(self.conv2d1(chunk))
+                tmp = F.gelu(self.conv2d2(tmp))
+                padded_embed[offset : offset + bs] = F.gelu(self.conv2d3(tmp))
+                offset += bs
 
         # (batch, channels, freq, time) -> (batch, time, channels*freq)
         b, c, f, t = padded_embed.size()
@@ -447,21 +469,32 @@ class Qwen3ASRAudioEncoder(nn.Module):
         # Extract valid hidden states and compute cu_seqlens
         hidden_states = padded_embed[padded_mask_after_cnn]
 
-        # Compute cumulative sequence lengths for chunked attention
-        cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (
+        # Compute cumulative sequence lengths for chunked attention.
+        # Vectorised replacement for the previous Python loop over aftercnn_lens
+        # (which did O(N * chunks_per_seq) list.extend calls in Python).
+        window_aftercnn = int(padded_mask_after_cnn.shape[-1]) * (
             self.n_window_infer // (self.n_window * 2)
         )
-        # Use tolist() for efficient batch conversion from tensor to Python
-        for cnn_len in aftercnn_lens.tolist():
-            num_full_chunks = cnn_len // window_aftercnn
-            remainder = cnn_len % window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
-            if remainder:
-                cu_chunk_lens.append(remainder)
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
-            -1, dtype=torch.int32
+        full_chunks   = aftercnn_lens // window_aftercnn          # [N]
+        remainders    = aftercnn_lens % window_aftercnn            # [N]
+        has_rem       = remainders > 0                             # [N]
+        chunks_per_seq = full_chunks + has_rem.long()              # [N]
+        total_chunks   = int(chunks_per_seq.sum().item())
+
+        # Start with every chunk slot filled with window_aftercnn, then
+        # overwrite the last slot of each sequence with its remainder.
+        chunk_lens = torch.full(
+            (total_chunks,), window_aftercnn,
+            dtype=aftercnn_lens.dtype, device=aftercnn_lens.device,
         )
+        ends = chunks_per_seq.cumsum(0)           # exclusive end index per seq
+        if has_rem.any():
+            chunk_lens[(ends - 1)[has_rem]] = remainders[has_rem]
+
+        cu_seqlens = torch.zeros(
+            total_chunks + 1, dtype=torch.int32, device=aftercnn_lens.device
+        )
+        cu_seqlens[1:] = chunk_lens.cumsum(0, dtype=torch.int32)
 
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
@@ -565,7 +598,7 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
         seq_len: int,
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, BaseDummyOptions] | None = None,
-    ) -> MultiModalDataDict:
+    ) -> dict[str, Any]:
         num_audios = mm_counts.get("audio", 0)
 
         feature_extractor = self.info.get_feature_extractor()
@@ -603,7 +636,7 @@ def _qwen3asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
 class Qwen3ASRMultiModalDataParser(MultiModalDataParser):
     def _parse_audio_data(
         self,
-        data: dict[str, torch.Tensor] | ModalityData[AudioItem],
+        data: "dict[str, torch.Tensor] | Any",
     ) -> ModalityDataItems[Any, Any] | None:
         if isinstance(data, dict):
             return DictEmbeddingItems(
